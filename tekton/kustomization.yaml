@@ -1,0 +1,8 @@
+# The MQ pipeline factory: vendored + modernized Tekton tasks and the
+# mq-qm-dev pipeline. Consumed as a remote kustomize base by
+# multi-tenancy-gitops-apps mq/environments/ci/pipelines.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - tasks
+  - pipelines

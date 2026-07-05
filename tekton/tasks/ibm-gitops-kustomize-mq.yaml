@@ -1,0 +1,195 @@
+# New task, July 2026 (IBM Client Engineering). Replaces the upstream
+# ibm-helm-release + ibm-gitops pair (which packaged the chart to an
+# Artifactory URL and updated a Helm-chart *reference* — infrastructure our
+# clusters don't run).
+#
+# This task delivers the pipeline result as a Git change: it renders the
+# kustomize overlay for one environment of the gitops-apps repo —
+#   <env>/<app-name>/queuemanager.yaml   (the QM repo's kustomize base CR,
+#                                         image pinned to the tested tag)
+#   <env>/<app-name>/kustomization.yaml  (configMapGenerator for the MQSC)
+#   <env>/<app-name>/static-definitions.mqsc
+# — exactly the file shape proven on multi-tenancy-gitops-apps branch
+# mq-qm01-dev-delivery (commit 4c5eb7c), and pushes it to a delivery branch,
+# ready for a pull request. Credentials come from the same git-credentials
+# secret the rest of the task family uses.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ibm-gitops-kustomize-mq
+  annotations:
+    description: Writes the tested queue manager image + MQSC as a kustomize overlay commit to the gitops-apps repo
+    app.openshift.io/description: Writes the tested queue manager image + MQSC as a kustomize overlay commit to the gitops-apps repo
+    app.openshift.io/vcs-uri: https://github.com/ibmclientengineering/mq-infra
+    app.openshift.io/vcs-ref: master
+  labels:
+    version: 1.0.0
+spec:
+  params:
+    - name: source-git-url
+      description: The queue manager repo (source of the kustomize base)
+    - name: source-git-revision
+      description: The revision of the queue manager repo that was built
+      default: master
+    - name: app-name
+      description: The queue manager application name (directory name under mq/environments/<environment>/)
+    - name: image-url
+      description: The full image reference (registry/namespace/repo:tag) of the tested, released image
+    - name: version
+      description: The release version being delivered (used in the commit message)
+      default: ""
+    - name: environment
+      description: The gitops-apps environment to deliver to
+      default: "dev"
+    - name: ha
+      description: When "true", deliver the native-ha-qmgr kustomize base instead of generic-qmgr
+      default: "false"
+    - name: security
+      description: Reserved. The QM repos do not ship a kustomize security overlay yet — security MQSC is only exercised by the smoke stage's chart flavor. When "true" a warning is logged.
+      default: "false"
+    - name: gitops-repo-url
+      description: The gitops-apps repo the overlay commit is pushed to
+      default: https://github.com/ibmclientengineering/multi-tenancy-gitops-apps.git
+    - name: gitops-branch
+      description: Branch to push the delivery commit to; defaults to <app-name>-<environment>-delivery
+      default: ""
+    - name: git-user-name
+      default: "MQ delivery pipeline"
+    - name: git-user-email
+      default: "mq-pipeline@ibmclientengineering.dev"
+  results:
+    - name: gitops-branch
+      description: The branch the delivery commit was pushed to
+    - name: gitops-commit
+      description: The sha of the delivery commit
+    - name: overlay-path
+      description: The overlay directory written in the gitops repo
+  volumes:
+    - name: source
+      emptyDir: {}
+    - name: gitops
+      emptyDir: {}
+  steps:
+    - name: render-and-push
+      image: docker.io/alpine/git:2.54.0
+      volumeMounts:
+        - name: source
+          mountPath: /source
+        - name: gitops
+          mountPath: /gitops
+      env:
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: password
+              optional: true
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: username
+              optional: true
+      script: |
+        #!/bin/sh
+        set -e
+
+        APP_NAME="$(params.app-name)"
+        IMAGE_URL="$(params.image-url)"
+        ENVIRONMENT="$(params.environment)"
+        VERSION="$(params.version)"
+
+        # --- flavor selection -------------------------------------------------
+        if [ "$(params.ha)" = "true" ]; then
+          FLAVOR="native-ha-qmgr"
+        else
+          FLAVOR="generic-qmgr"
+        fi
+        if [ "$(params.security)" = "true" ]; then
+          echo "WARNING: security=true — the QM repos have no kustomize security overlay yet;"
+          echo "security MQSC was exercised by the smoke stage's chart flavor only."
+          echo "The delivered overlay is the ${FLAVOR} base without security additions."
+        fi
+
+        # --- clone the QM source repo at the built revision -------------------
+        set +x
+        if [ -n "${GIT_USERNAME}" ] && [ -n "${GIT_PASSWORD}" ]; then
+          git clone "$(echo $(params.source-git-url) | awk -F '://' '{print $1}')://${GIT_USERNAME}:${GIT_PASSWORD}@$(echo $(params.source-git-url) | awk -F '://' '{print $2}')" /source
+        else
+          git clone "$(params.source-git-url)" /source
+        fi
+        cd /source
+        git checkout "$(params.source-git-revision)"
+
+        BASE_DIR="/source/kustomize/base/${FLAVOR}"
+        if [ ! -d "${BASE_DIR}" ]; then
+          echo "ERROR: ${BASE_DIR} not found in the source repo — cannot render the delivery overlay"
+          exit 1
+        fi
+
+        # --- clone the gitops repo and create the delivery branch -------------
+        if [ -z "${GIT_USERNAME}" ] || [ -z "${GIT_PASSWORD}" ]; then
+          echo "ERROR: git-credentials secret (username/password) is required to push the delivery commit"
+          exit 1
+        fi
+        git clone "$(echo $(params.gitops-repo-url) | awk -F '://' '{print $1}')://${GIT_USERNAME}:${GIT_PASSWORD}@$(echo $(params.gitops-repo-url) | awk -F '://' '{print $2}')" /gitops
+        cd /gitops
+
+        BRANCH="$(params.gitops-branch)"
+        if [ -z "${BRANCH}" ]; then
+          BRANCH="${APP_NAME}-${ENVIRONMENT}-delivery"
+        fi
+        git checkout -B "${BRANCH}"
+
+        # --- render the overlay (shape proven on branch mq-qm01-dev-delivery) -
+        DEST="mq/environments/${ENVIRONMENT}/${APP_NAME}"
+        mkdir -p "${DEST}"
+
+        # Pin the tested image. The base publishes the placeholder as
+        # image: "replace" (which YAML may render unquoted) — stamp the whole line.
+        sed -E "s|^([ ]*image:) .*$|\1 ${IMAGE_URL}|" \
+          "${BASE_DIR}/queuemanager.yaml" > "${DEST}/queuemanager.yaml"
+
+        cp "${BASE_DIR}/static-definitions.mqsc" "${DEST}/static-definitions.mqsc"
+
+        cat > "${DEST}/kustomization.yaml" <<EOF
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+        resources:
+          - queuemanager.yaml
+        configMapGenerator:
+          - name: mqsc-configmap
+            behavior: create
+            files:
+              - static-definitions.mqsc
+        generatorOptions:
+          disableNameSuffixHash: true
+        EOF
+
+        # --- commit + push -----------------------------------------------------
+        git config user.name "$(params.git-user-name)"
+        git config user.email "$(params.git-user-email)"
+        git add "${DEST}"
+
+        if git diff --cached --quiet; then
+          echo "No changes to deliver — overlay already matches the tested image"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+        else
+          MSG="${APP_NAME} ${ENVIRONMENT} delivery: ${IMAGE_URL}"
+          if [ -n "${VERSION}" ]; then
+            MSG="${MSG} (release ${VERSION})"
+          fi
+          git commit -m "${MSG}" \
+            -m "Delivered by the mq-qm-dev pipeline from $(params.source-git-url) @ $(params.source-git-revision) (${FLAVOR})."
+          COMMIT_SHA="$(git rev-parse HEAD)"
+        fi
+
+        git push -f origin "${BRANCH}"
+
+        echo -n "${BRANCH}" > $(results.gitops-branch.path)
+        echo -n "${COMMIT_SHA}" > $(results.gitops-commit.path)
+        echo -n "${DEST}" > $(results.overlay-path.path)
+
+        echo ""
+        echo "Delivery pushed: ${BRANCH} @ ${COMMIT_SHA}"
+        echo "Open a PR to merge ${DEST} into the default branch."

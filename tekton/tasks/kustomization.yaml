@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ibm-setup.yaml
+  - ibm-build-tag-push.yaml
+  - ibm-smoke-tests-mq.yaml
+  - ibm-tag-release.yaml
+  - ibm-img-release.yaml
+  - ibm-img-scan.yaml
+  - ibm-gitops-kustomize-mq.yaml

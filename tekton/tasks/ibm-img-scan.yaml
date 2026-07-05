@@ -1,0 +1,310 @@
+# Vendored from IBM/ibm-garage-tekton-tasks (tasks/9-img-scan.yaml), Apache-2.0.
+# Modernized July 2026: tekton.dev/v1 (dropped v1beta1 stepTemplate.name and
+# empty step resources blocks); SETFCAP on the buildah/skopeo steps (same
+# pod-security pattern proven on build/img-release — this task itself has not
+# yet run on-cluster); buildah/skopeo pinned to the platform rhel9 digests;
+# Trivy pinned to a current release; EOL ibmcloud-dev tools image replaced by
+# the IBM Continuous Delivery pipeline base image for the VA-scan step; two
+# upstream shell bugs fixed ([ =~ ] and unquoted -z test).
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ibm-img-scan
+  annotations:
+    description: Runs an image scan with Trivy or IBM VA and fails the build if issues are found.
+    app.openshift.io/description: Runs an image scan with Trivy or IBM VA and fails the build if issues are found.
+    app.openshift.io/vcs-uri: https://github.com/ibmclientengineering/mq-infra
+    app.openshift.io/vcs-ref: master
+  labels:
+    version: 1.0.0
+spec:
+  params:
+    - name: GIT_URL
+      default: ''
+      description: >-
+        URL of git repo, if provided it allows .trivyignore to be used from
+        project source when running scan
+      type: string
+    - name: GIT_REVISION
+      default: master
+      type: string
+    - default: /source
+      name: source-dir
+      type: string
+    - name: image-url
+      description: "The location of image to scan on IBM Container Registry <server>/<namespace>/<repository>:<tag>"
+    - name: scan-trivy
+      description: Flag indicating that a scan should be performed with Trivy
+      default: "false"
+    - name: trivy-ignoreUnfixed
+      description: Flag indicating that Trivy scans should ignore unfixed vulnerabilities
+      default: "true"
+    - name: scan-ibm
+      description: Flag indicating that a scan should be performed with IBM VA
+      default: "false"
+    - name: SKOPEO_IMAGE
+      default: registry.redhat.io/rhel9/skopeo@sha256:51bbf898541d2f41775074028c365edaeb840fb14e88f4dcef96174d5d0864c5
+    - name: BUILDER_IMAGE
+      default: registry.redhat.io/rhel9/buildah@sha256:2347646db766dad7d85dfa9226e185e1d4de5defe26e28f4e7ca0d09b19e1bef
+    - name: IMAGE_FROM_TLS_VERIFY
+      default: "false"
+    - name: TRIVY_IMAGE
+      default: docker.io/aquasec/trivy:0.72.0
+    - name: IBMCLOUD_IMAGE
+      description: Image providing the ibmcloud CLI for the optional IBM VA scan step
+      default: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:latest
+  volumes:
+    - name: oci-image
+      emptyDir: {}
+    - name: source
+      emptyDir: {}
+    - name: varlibcontainers
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: $(params.source-dir)
+        name: source
+  steps:
+    - name: setup-docker-auth
+      image: $(params.BUILDER_IMAGE)
+      securityContext:
+        capabilities:
+          add:
+            - SETFCAP
+      env:
+        - name: REGISTRY_USER
+          valueFrom:
+            secretKeyRef:
+              name: registry-access
+              key: REGISTRY_USER
+              optional: true
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: registry-access
+              key: REGISTRY_PASSWORD
+              optional: true
+        - name: AUTH_CONFIG
+          valueFrom:
+            secretKeyRef:
+              name: registry-auth
+              key: .dockerconfigjson
+              optional: true
+        - name: AUTH_CONFIG_OVERRIDE
+          valueFrom:
+            secretKeyRef:
+              name: registry-auth-local
+              key: .dockerconfigjson
+              optional: true
+        - name: IBM_ENTITLED_REGISTRY_USER
+          valueFrom:
+            secretKeyRef:
+              name: ibm-entitled-registry-credentials
+              key: IBM_ENTITLED_REGISTRY_USER
+              optional: true
+        - name: IBM_ENTITLED_REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ibm-entitled-registry-credentials
+              key: IBM_ENTITLED_REGISTRY_PASSWORD
+              optional: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+      script: |
+        if [[ -n "${AUTH_CONFIG_OVERRIDE}" ]]; then
+          AUTH_CONFIG="${AUTH_CONFIG_OVERRIDE}"
+        elif [[ -z "${AUTH_CONFIG}" ]]; then
+          AUTH_CONFIG="{}"
+        fi
+
+        AUTH_FILE="/var/lib/containers/auth.json"
+
+        echo "${AUTH_CONFIG}" > "${AUTH_FILE}"
+
+        if [[ -n "${IBM_ENTITLED_REGISTRY_USER}" ]] && [[ -n "${IBM_ENTITLED_REGISTRY_PASSWORD}" ]]; then
+          buildah login --authfile "${AUTH_FILE}" -u ${IBM_ENTITLED_REGISTRY_USER} -p ${IBM_ENTITLED_REGISTRY_PASSWORD} cp.icr.io
+          echo "buildah login --authfile \"${AUTH_FILE}\" -u \"${IBM_ENTITLED_REGISTRY_USER}\" -p \"xxxxx\" cp.icr.io"
+        fi
+
+        IMAGE_URL="$(params.image-url)"
+        REGISTRY_SERVER=$(echo "${IMAGE_URL}" | awk -F / '{print $1}')
+
+        if [[ -n "${REGISTRY_USER}" ]] && [[ -n "${REGISTRY_PASSWORD}" ]] && [[ "${REGISTRY_SERVER}" != "image-registry.openshift-image-registry.svc:5000"  ]]; then
+          buildah login --authfile "${AUTH_FILE}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}" "${REGISTRY_SERVER}"
+          echo "buildah login --authfile \"${AUTH_FILE}\" -u \"${REGISTRY_USER}\" -p \"xxxxx\" \"${REGISTRY_SERVER}\""
+        fi
+
+        echo "Auth file: ${AUTH_FILE}"
+    - name: git-clone
+      image: docker.io/alpine/git:2.54.0
+      env:
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: git-credentials
+              optional: true
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: git-credentials
+              optional: true
+      script: |
+        set +x
+
+        if [ -z "$(params.GIT_URL)" ]; then
+            echo "No git URL provided, skipping clone"
+            exit 0
+        fi
+
+        if [[ -n "${GIT_USERNAME}" ]] && [[ -n "${GIT_PASSWORD}" ]]; then
+            git clone "$(echo $(params.GIT_URL) | awk -F '://' '{print $1}')://${GIT_USERNAME}:${GIT_PASSWORD}@$(echo $(params.GIT_URL) | awk -F '://' '{print $2}')" $(params.source-dir)
+        else
+            set -x
+            git clone $(params.GIT_URL) $(params.source-dir)
+        fi
+        set -x
+        cd $(params.source-dir)
+        git checkout $(params.GIT_REVISION)
+    - name: trivy-pull
+      image: $(params.SKOPEO_IMAGE)
+      securityContext:
+        capabilities:
+          add:
+            - SETFCAP
+      volumeMounts:
+        - mountPath: /var/oci
+          name: oci-image
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+      workingDir: $(params.source-dir)
+      script: |
+        AUTH_FILE="/var/lib/containers/auth.json"
+        echo "Auth file: ${AUTH_FILE}"
+
+        set -ex
+        PERFORM_SCAN="$(params.scan-trivy)"
+        if [[ "${PERFORM_SCAN}" == "false" ]] || [[ -z "${PERFORM_SCAN}" ]]; then
+          echo "User selected to skip scanning. Skipping Trivy scan."
+          exit 0
+        fi
+
+        IMAGE_FROM=$(params.image-url)
+        REGISTRY_SERVER_FROM=$(echo "${IMAGE_FROM}" | awk -F / '{print $1}')
+        IMAGE_TO="oci:/var/oci/image"
+        IMAGE_FROM_TLS_VERIFY=$(params.IMAGE_FROM_TLS_VERIFY)
+
+        echo "Tagging ${IMAGE_FROM} as ${IMAGE_TO}"
+
+        if [[ "${REGISTRY_SERVER_FROM}" =~ ":" ]]; then
+          IMAGE_FROM_TLS_VERIFY="false"
+        fi
+
+        echo "skopeo copy --authfile=${AUTH_FILE} --src-tls-verify=${IMAGE_FROM_TLS_VERIFY} docker://${IMAGE_FROM} ${IMAGE_TO}"
+        skopeo copy --authfile=${AUTH_FILE} --src-tls-verify=${IMAGE_FROM_TLS_VERIFY} docker://${IMAGE_FROM} ${IMAGE_TO}
+    - name: trivy-scan
+      image: $(params.TRIVY_IMAGE)
+      volumeMounts:
+        - mountPath: /var/oci
+          name: oci-image
+      workingDir: $(params.source-dir)
+      script: |
+          set -ex
+          PERFORM_SCAN="$(params.scan-trivy)"
+          if [[ "${PERFORM_SCAN}" == "false" ]] || [[ -z "${PERFORM_SCAN}" ]]; then
+            echo "User selected to skip scanning. Skipping Trivy scan."
+            exit 0
+          fi
+          PATH_TO_IMAGE="/var/oci/image"
+          echo -e "Trivy Security Scan image in registry"
+          trivy image --exit-code 0 --input ${PATH_TO_IMAGE}
+          TRIVY_IGNORE_UNFIXED="$(params.trivy-ignoreUnfixed)" trivy image --exit-code 1 --severity CRITICAL --input ${PATH_TO_IMAGE}
+          my_exit_code=$?
+          echo "Scan exit code :--- $my_exit_code"
+          if [ ${my_exit_code} == 1 ]; then
+              echo "Trivy scanning completed. CRITICAL Vulnerabilities found."
+              exit 1
+          else
+            echo "Trivy scanning completed. CRITICAL vulnerabilities not found."
+          fi
+    - name: ibm-scan
+      image: $(params.IBMCLOUD_IMAGE)
+      env:
+        - name: HOME
+          value: /home/devops
+        - name: IBM_CLOUD_APIKEY
+          valueFrom:
+            secretKeyRef:
+              key: APIKEY
+              name: ibmcloud-apikey
+              optional: true
+        - name: IBM_CLOUD_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ibmcloud-config
+              key: REGION
+              optional: true
+      script: |
+          #!/usr/bin/env bash
+          set -ex
+          PERFORM_SCAN="$(params.scan-ibm)"
+          if [[ "${PERFORM_SCAN}" == "false" ]] || [[ -z "${PERFORM_SCAN}" ]]; then
+            echo "User selected to skip scanning. Skipping Vulnerability Advisor validation."
+            exit 0
+          fi
+
+          IMAGE_URL=$(params.image-url)
+          REGISTRY_SERVER=$(echo $(params.image-url) | awk -F / '{print $1}')
+
+          if [[ ! "${REGISTRY_SERVER}" =~ icr.io ]]; then
+            echo "The image is not stored in the IBM Cloud Image Registry. Skipping Vulnerability Advisor validation"
+            exit 0
+          fi
+
+
+          echo -e "VA Security Scan image in registry"
+
+          echo "Registry URL: ${REGISTRY_SERVER}"
+
+          set +x
+          ibmcloud login --apikey ${IBM_CLOUD_APIKEY} -r ${IBM_CLOUD_REGION}
+          ibmcloud target -r ${IBM_CLOUD_REGION}
+          set -x
+          ibmcloud cr namespace-list
+
+          echo "Getting the VA status of ${IMAGE_URL}"
+
+          set +e
+          ibmcloud cr va ${IMAGE_URL} --output json | grep -i "Try again later"
+          retry=$?
+          while [ $retry -eq 0 ]; do
+            sleep 30
+            echo "Trying again to see if scan is done"
+            ibmcloud cr va ${IMAGE_URL} --output json | grep -i "Try again later"
+            retry=$?
+          done
+          set -e
+          ibmcloud cr va ${IMAGE_URL} --output json
+          echo "Saving results to va-result.json"
+          ibmcloud cr va ${IMAGE_URL} --output json > va-result.json
+          VA_STATUS=$(cat va-result.json | jq -r '.[].status')
+
+          echo "VA scan status: ${VA_STATUS}"
+
+          if [[ "${VA_STATUS}" == "OK" ]]; then
+            echo "VA - No Issues in the image"
+            exit 0
+          elif [[ $(cat va-result.json | jq -r '.[].vulnerabilities | length') -gt 0 ]]; then
+            echo "VA Failure: $(cat va-result.json | jq -r '.[].vulnerabilities | length') vulnerabilities found in the image"
+            cat va-result.json | jq -r '.[].vulnerabilities'
+            exit 1
+          elif [[ $(cat va-result.json | jq -r '.[].configuration_issues | length') -gt 0 ]]; then
+            echo "VA Warning - $(cat va-result.json | jq -r '.[].configuration_issues | length') configuration issues found in the image"
+            cat va-result.json | jq -r '.[].configuration_issues'
+            exit 0
+          else
+            echo "VA Warning: non-OK status from Vulnerability Advisor ${VA_STATUS}"
+            cat va-result.json | jq -r '.[]'
+          fi

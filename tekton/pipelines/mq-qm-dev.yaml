@@ -1,0 +1,169 @@
+# Vendored from IBM/ibm-garage-tekton-tasks (pipelines/mq-pipeline.yaml,
+# pipeline "ibm-mq"), Apache-2.0. Modernized July 2026:
+#   - renamed mq-qm-dev; apiVersion tekton.dev/v1
+#   - new params: image-url (registry override — without it the setup task
+#     computes image-registry.openshift-image-registry.svc:5000/<ns>/<repo>:<sha>),
+#     security and ha (which chart/kustomize flavor the smoke and delivery
+#     stages use), gitops-repo-url (delivery target)
+#   - the upstream helm-release (Artifactory) + gitops (helm-chart reference)
+#     pair is replaced by one gitops stage that writes the kustomize overlay
+#     (QueueManager CR pinned to the tested image + MQSC ConfigMap files) to a
+#     delivery branch of the gitops-apps repo, ready for a PR.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: mq-qm-dev
+  annotations:
+    app.openshift.io/runtime: mq
+    description: Builds a queue manager image from a QM repo, smoke-tests and scans it, then delivers the result as a kustomize overlay commit to the gitops-apps repo
+spec:
+  params:
+    - name: git-url
+      description: The url for the git repository (the queue manager repo to build)
+    - name: git-revision
+      description: The git revision (branch, tag, or sha) that should be built
+      default: master
+    - name: scan-image
+      description: Enable the pipeline to scan the image for vulnerabilities
+      default: "true"
+    - name: image-url
+      description: >-
+        Registry override for the built image
+        (<server>/<namespace>/<repository>:<tag>, any part optional). Default
+        "" computes the internal registry route:
+        image-registry.openshift-image-registry.svc:5000/<pipeline-namespace>/<repo-name>:<short-sha>
+      default: ""
+    - name: security
+      description: When "true", smoke-test with the chart's security MQSC flavor (chart/base/security). The kustomize delivery has no security overlay yet.
+      default: "false"
+    - name: ha
+      description: When "true", smoke-test with NativeHA availability and deliver the native-ha-qmgr kustomize base instead of generic-qmgr
+      default: "false"
+    - name: gitops-repo-url
+      description: The gitops-apps repo the delivery stage pushes the rendered overlay to
+      default: https://github.com/ibmclientengineering/multi-tenancy-gitops-apps.git
+  tasks:
+    - name: setup
+      taskRef:
+        name: ibm-setup
+      params:
+        - name: git-url
+          value: $(params.git-url)
+        - name: git-revision
+          value: $(params.git-revision)
+        - name: scan-image
+          value: $(params.scan-image)
+        - name: image-url
+          value: $(params.image-url)
+    - name: build
+      taskRef:
+        name: ibm-build-tag-push
+      runAfter:
+        - setup
+      params:
+        - name: git-url
+          value: "$(tasks.setup.results.git-url)"
+        - name: git-revision
+          value: "$(tasks.setup.results.git-revision)"
+        - name: source-dir
+          value: "$(tasks.setup.results.source-dir)"
+        - name: image-server
+          value: "$(tasks.setup.results.image-server)"
+        - name: image-namespace
+          value: "$(tasks.setup.results.image-namespace)"
+        - name: image-repository
+          value: "$(tasks.setup.results.image-repository)"
+        - name: image-tag
+          value: "$(tasks.setup.results.image-tag)"
+    - name: smoke-tests-mq
+      taskRef:
+        name: ibm-smoke-tests-mq
+      runAfter:
+        - build
+      params:
+        - name: git-url
+          value: "$(tasks.setup.results.git-url)"
+        - name: git-revision
+          value: "$(tasks.setup.results.git-revision)"
+        - name: source-dir
+          value: "$(tasks.setup.results.source-dir)"
+        - name: image-server
+          value: "$(tasks.setup.results.image-server)"
+        - name: image-namespace
+          value: "$(tasks.setup.results.image-namespace)"
+        - name: image-repository
+          value: "$(tasks.setup.results.image-repository)"
+        - name: image-tag
+          value: "$(tasks.setup.results.image-tag)"
+        - name: app-namespace
+          value: "$(tasks.setup.results.app-namespace)"
+        - name: app-name
+          value: "$(tasks.setup.results.app-name)"
+        - name: deploy-ingress-type
+          value: "$(tasks.setup.results.deploy-ingress-type)"
+        - name: tools-image
+          value: "$(tasks.setup.results.tools-image)"
+        - name: security
+          value: "$(params.security)"
+        - name: ha
+          value: "$(params.ha)"
+    - name: tag-release
+      taskRef:
+        name: ibm-tag-release
+      runAfter:
+        - smoke-tests-mq
+      params:
+        - name: git-url
+          value: "$(tasks.setup.results.git-url)"
+        - name: git-revision
+          value: "$(tasks.setup.results.git-revision)"
+        - name: source-dir
+          value: "$(tasks.setup.results.source-dir)"
+        - name: js-image
+          value: "$(tasks.setup.results.js-image)"
+    - name: img-release
+      taskRef:
+        name: ibm-img-release
+      runAfter:
+        - tag-release
+      params:
+        - name: image-from
+          value: "$(tasks.setup.results.image-url)"
+        - name: image-to
+          value: "$(tasks.setup.results.image-release):$(tasks.tag-release.results.tag)"
+    - name: img-scan
+      taskRef:
+        name: ibm-img-scan
+      runAfter:
+        - img-release
+      params:
+        - name: image-url
+          value: $(tasks.img-release.results.image-url)
+        - name: scan-trivy
+          value: $(tasks.setup.results.scan-trivy)
+        - name: scan-ibm
+          value: $(tasks.setup.results.scan-ibm)
+    - name: gitops
+      taskRef:
+        name: ibm-gitops-kustomize-mq
+      runAfter:
+        - img-scan
+      params:
+        - name: source-git-url
+          value: "$(tasks.setup.results.git-url)"
+        - name: source-git-revision
+          value: "$(tasks.setup.results.git-revision)"
+        - name: app-name
+          value: "$(tasks.setup.results.app-name)"
+        - name: image-url
+          value: "$(tasks.img-release.results.image-url)"
+        - name: version
+          value: "$(tasks.tag-release.results.tag)"
+        - name: environment
+          value: "dev"
+        - name: ha
+          value: "$(params.ha)"
+        - name: security
+          value: "$(params.security)"
+        - name: gitops-repo-url
+          value: "$(params.gitops-repo-url)"

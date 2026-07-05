@@ -1,16 +1,17 @@
 # mq-infra
 
-This project contains necessary artifacts for deploying queuemanager on Openshift.
+This project is the shared MQ build infrastructure — the Tekton pipeline and task library every queue manager repo builds with, plus the MQ image Dockerfile and Helm chart template.
 
 ## Table of Contents
 
 * [Introduction](#introduction)
+* [Pipeline (vendored + modernized)](#pipeline-vendored--modernized)
 * [Pre-requisites](#pre-requisites)
 * [Queuemanager Details](#queuemanager-details)
 
 ## Introduction
 
-This guide provides a walkthrough on how to set up an Queuemanager.  The Github repository is a template containing a Dockerfile and Helm Chart which is used with the [Cloud Native Toolkit](https://cloudnativetoolkit.dev/) to register a Tekton pipeline to build a Queuemanager image and deploy it on a containerized instance of IBM MQ.
+This guide provides a walkthrough on how to set up an Queuemanager.  The Github repository contains a Dockerfile and Helm Chart template, and — under `tekton/` — the vendored pipeline and task library (originally from the [Cloud Native Toolkit](https://cloudnativetoolkit.dev/)) used to build a Queuemanager image and deliver it through GitOps on a containerized instance of IBM MQ.
 
 This repo contains the below artifacts.
 
@@ -19,7 +20,7 @@ This repo contains the below artifacts.
 .
 ├── Dockerfile
 ├── README.md
-└── chart
+├── chart
     └── base
         ├── Chart.yaml
         ├── config
@@ -32,11 +33,38 @@ This repo contains the below artifacts.
         │   ├── configmap.yaml
         │   └── qm-template.yaml
         └── values.yaml
+└── tekton
+    ├── LICENSE                        # Apache-2.0 (upstream license for the vendored files)
+    ├── kustomization.yaml             # apply the whole factory with one kustomize build
+    ├── pipelines
+    │   └── mq-qm-dev.yaml             # the queue manager pipeline
+    └── tasks                          # the task library the pipeline references
+        ├── ibm-setup.yaml
+        ├── ibm-build-tag-push.yaml
+        ├── ibm-smoke-tests-mq.yaml
+        ├── ibm-tag-release.yaml
+        ├── ibm-img-release.yaml
+        ├── ibm-img-scan.yaml
+        └── ibm-gitops-kustomize-mq.yaml
 ```
 
 - `ibm-mqadvanced-server-integration` docker image that comes with CloudPaks. This image can be further customized if we need additional configurations that are part of queuemanager.
 - `Helm Charts` - Currently, we are using quickstart template as our base and building additional things on top of it for deploying the queuemanager.
 - `Configurations` - Like mentioned earlier, the configurations can be embedded as part of Dockerfile. Alternatively, they can also be injected as configmaps.
+
+
+## Pipeline (vendored + modernized)
+
+**Provenance:** the pipeline and tasks under `tekton/` are ported from the Cloud Native Toolkit's [IBM/ibm-garage-tekton-tasks](https://github.com/IBM/ibm-garage-tekton-tasks) (pipeline `ibm-mq` and the `ibm-*` tasks it references), licensed Apache-2.0 — the upstream license text is kept at `tekton/LICENSE`. They were vendored here in July 2026 so this repo actually owns the factory role, and modernized against a live OpenShift 4.18 / OpenShift Pipelines 1.22 cluster:
+
+- **Tekton `tekton.dev/v1`** for the Pipeline and all Tasks (upstream is `v1beta1`; it still converts today, but v1 is the API current clusters serve).
+- **Pod-security fixes** — the real 2021 rot. The buildah/skopeo steps of `ibm-build-tag-push` and `ibm-img-release` carry `securityContext: {capabilities: {add: [SETFCAP]}}` (without it buildah dies writing `uid_map` under current SCCs), and the `ibm-smoke-tests-mq` deploy/health-check/cleanup steps run with `runAsUser: 0` so they can write the shared clone volume. Both fixes are exactly the patches that turned red validation PipelineRuns green.
+- **Kustomize delivery** — the upstream `ibm-helm-release` (Artifactory) + `ibm-gitops` (Helm-chart reference) stages are replaced by one `ibm-gitops-kustomize-mq` task that writes the tested image + MQSC as a kustomize overlay (`queuemanager.yaml`, `kustomization.yaml`, `static-definitions.mqsc`) to a delivery branch of [multi-tenancy-gitops-apps](https://github.com/ibmclientengineering/multi-tenancy-gitops-apps), ready for a PR.
+- **Maintained step images** — the EOL `node:lts-stretch`, `ibmcloud-dev` (yq v3) and 2021 buildah/skopeo pins are replaced with current images (buildah/skopeo at the digests OpenShift Pipelines itself ships; `alpine/k8s` as the kubectl+helm+yq tools image, scripts ported to yq v4; `node:22` for release tagging; pinned Trivy).
+
+The pipeline is named **`mq-qm-dev`** and exposes: `git-url`, `git-revision`, `scan-image`, `image-url` (registry override; empty = the internal registry `image-registry.openshift-image-registry.svc:5000/<namespace>/<repo>:<short-sha>`), `security` and `ha` (which chart/kustomize flavor the smoke and delivery stages use), and `gitops-repo-url` (where the delivery stage pushes). Before the first run the pipeline namespace needs the `ibm-entitled-registry-credentials` (or `registry-auth`) secret so buildah can pull the entitled MQ base image, and a `git-credentials` secret (username/password) so the tag-release and gitops stages can push. The cluster's integrated image registry must be enabled (`managementState: Managed`) — it is the only in-cluster registry nodes can pull from.
+
+The intended consumption path is GitOps: `mq/environments/ci/pipelines` in your `multi-tenancy-gitops-apps` fork references `tekton/` here as a remote kustomize base, so an Argo CD Application delivers the Pipelines and Tasks into the `ci` namespace by commit. `oc apply -k tekton/` works for a manual bootstrap.
 
 ## Pre-requisites
 
