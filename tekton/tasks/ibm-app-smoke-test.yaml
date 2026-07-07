@@ -1,0 +1,98 @@
+# App smoke test — deploys the freshly built mq-spring-app image and proves it
+# reaches a LIVE queue manager end to end: the readiness probe includes the JMS
+# binding (Ready == connected to MQ), then a send/recv round-trip over a real queue.
+# Modeled on the mq-infra factory style; tekton.dev/v1. Non-TLS dev connection.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ibm-app-smoke-test
+  labels:
+    version: 1.0.0
+spec:
+  params:
+    - name: image-url
+      description: The built app image to smoke-test (server/namespace/repo:tag)
+    - name: qm
+      description: Queue manager name
+    - name: channel
+      default: IBM.APP.SVRCONN
+    - name: conn-name
+      description: MQ connection name, host(port) — e.g. mq-quickstart-ibm-mq.tools.svc.cluster.local(1414)
+    - name: queue-name
+      default: IBM.DEMO.Q
+    - name: app-name
+      default: mq-spring-app
+  steps:
+    - name: deploy-and-test
+      image: registry.redhat.io/openshift4/ose-cli:latest
+      env:
+        - name: IMAGE
+          value: "$(params.image-url)"
+        - name: QM
+          value: "$(params.qm)"
+        - name: CHANNEL
+          value: "$(params.channel)"
+        - name: CONNECTION_NAME
+          value: "$(params.conn-name)"
+        - name: QUEUE_NAME
+          value: "$(params.queue-name)"
+      script: |
+        set -e
+        NAME=$(params.app-name)-smoke
+        echo "### deploying candidate $NAME from ${IMAGE} ###"
+        cat <<EOF | oc apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${NAME}
+          labels: { app: ${NAME} }
+        spec:
+          replicas: 1
+          selector: { matchLabels: { app: ${NAME} } }
+          template:
+            metadata: { labels: { app: ${NAME} } }
+            spec:
+              containers:
+                - name: app
+                  image: ${IMAGE}
+                  ports: [ { containerPort: 8080 } ]
+                  env:
+                    - { name: QM, value: "${QM}" }
+                    - { name: CHANNEL, value: "${CHANNEL}" }
+                    - { name: CONNECTION_NAME, value: "${CONNECTION_NAME}" }
+                    - { name: QUEUE_NAME, value: "${QUEUE_NAME}" }
+                  readinessProbe:
+                    httpGet: { path: /actuator/health, port: 8080 }
+                    initialDelaySeconds: 20
+                    periodSeconds: 10
+                    failureThreshold: 15
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: { name: ${NAME} }
+        spec:
+          selector: { app: ${NAME} }
+          ports: [ { port: 8080, targetPort: 8080 } ]
+        EOF
+
+        cleanup() { echo "### cleanup ###"; oc delete deploy,svc ${NAME} --ignore-not-found; }
+        trap cleanup EXIT
+
+        echo "### waiting for Ready (Ready == JMS bound to ${QM}) ###"
+        if ! oc rollout status deploy/${NAME} --timeout=240s; then
+          echo "!! app never became Ready — it could not bind to the queue manager"
+          oc logs deploy/${NAME} --tail=40 || true
+          exit 1
+        fi
+
+        BASE="http://${NAME}:8080"
+        echo "### /actuator/health — expect jms UP ###"
+        curl -sf "${BASE}/actuator/health" | tee /tmp/health; echo
+        grep -q '"jms"' /tmp/health && grep -q '"status":"UP"' /tmp/health || { echo "!! jms not UP"; exit 1; }
+
+        echo "### send-hello-world -> recv round trip on ${QUEUE_NAME} ###"
+        curl -sf "${BASE}/api/send-hello-world"; echo
+        RECV=$(curl -sf "${BASE}/api/recv"); echo "recv: ${RECV}"
+        echo "${RECV}" | grep -qi "hello" || { echo "!! did not get the message back"; exit 1; }
+
+        echo "### SMOKE TEST PASSED: message put and got back through a live queue manager ###"

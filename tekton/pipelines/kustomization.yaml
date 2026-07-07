@@ -2,3 +2,4 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - mq-qm-dev.yaml
+  - mq-spring-app-dev.yaml

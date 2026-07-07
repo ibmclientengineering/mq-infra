@@ -8,3 +8,4 @@ resources:
   - ibm-img-release.yaml
   - ibm-img-scan.yaml
   - ibm-gitops-kustomize-mq.yaml
+  - ibm-app-smoke-test.yaml
