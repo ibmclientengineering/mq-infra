@@ -8,17 +8,22 @@ metadata:
     description: Gate-test a deployed queue manager, then promote its overlay to the next environment as a pull request.
 spec:
   description: >-
-    The promotion half of the MQ factory. It gates on evidence — a functional put/get against the
-    queue manager in the source environment — and only then copies that proven overlay forward and
-    opens a pull request to the next environment. A machine assembles the evidence; a human reads the
-    diff and merges; Argo CD deploys. Reusable for any hop (dev→staging, staging→prod) via params.
+    The promotion half of the MQ factory. It gates on evidence — a functional put/get through a
+    dedicated gate queue on the queue manager in the source environment — and only then copies that
+    proven overlay forward and opens a pull request to the next environment. A machine assembles the
+    evidence; a human reads the diff and merges; Argo CD deploys. Reusable for any MQ hop
+    (dev→staging, staging→prod) via params. The `ibm-gitops-promote` task is product-generic (point
+    `product-path` at ace/environments to reuse it for ACE, paired with an ACE-appropriate gate).
   params:
     - name: unit
       default: mq-qm01
     - name: qm-name
       default: QM1
-    - name: queue
-      default: IBM.DEMO.Q
+    - name: qm-pod-grep
+      description: Substring matching the queue-manager pod (thread this if the QM name isn't the default).
+      default: qm1-ibm-mq
+    - name: gate-queue
+      default: PROMOTE.GATE.Q
     - name: src-env
       default: staging
     - name: target-env
@@ -31,8 +36,9 @@ spec:
         name: ibm-mq-gate-test
       params:
         - { name: qm-namespace, value: "$(params.src-env)" }
+        - { name: qm-pod-grep, value: "$(params.qm-pod-grep)" }
         - { name: qm-name, value: "$(params.qm-name)" }
-        - { name: queue, value: "$(params.queue)" }
+        - { name: gate-queue, value: "$(params.gate-queue)" }
     - name: promote
       runAfter: [ gate-test ]
       taskRef:

@@ -5,13 +5,14 @@ metadata:
   labels:
     app.kubernetes.io/part-of: mq-infra
   annotations:
-    description: Functional promotion gate — put a message on a deployed queue manager and read it back before allowing promotion.
+    description: Functional promotion gate — put a message on a dedicated gate queue on the deployed queue manager and read it back.
 spec:
   description: >-
-    The gate that guards a promotion. Puts a message on a queue on the deployed queue manager
-    and reads it back, proving the environment actually processes messages before its config is
-    promoted onward. Reusable across environments (dev / staging) via params. The pipeline SA
-    needs exec on the queue manager's namespace.
+    The gate that guards a promotion. Puts a message on a DEDICATED gate queue on the deployed
+    queue manager and reads it back, proving the environment actually processes messages — without
+    ever draining an application queue. Reusable across environments via params, which are passed
+    as env vars and handed to the in-pod commands as positional args (never string-interpolated),
+    so param values cannot inject shell. The pipeline SA needs exec on the queue manager's namespace.
   params:
     - name: qm-namespace
       description: Namespace of the queue manager to gate-test.
@@ -22,25 +23,35 @@ spec:
     - name: qm-name
       description: The queue manager name (QMNAME).
       default: QM1
-    - name: queue
-      description: A local queue to round-trip a message through.
-      default: IBM.DEMO.Q
+    - name: gate-queue
+      description: A dedicated local queue the gate defines and round-trips a message through (never an app queue).
+      default: PROMOTE.GATE.Q
   steps:
     - name: put-get
       image: quay.io/openshift/origin-cli:4.18
+      env:
+        - name: QM_NAMESPACE
+          value: $(params.qm-namespace)
+        - name: QM_POD_GREP
+          value: $(params.qm-pod-grep)
+        - name: QM_NAME
+          value: $(params.qm-name)
+        - name: GATE_QUEUE
+          value: $(params.gate-queue)
       script: |
         #!/bin/bash
         set -e
-        NS="$(params.qm-namespace)"
-        POD=$(oc get pods -n "$NS" --field-selector=status.phase=Running -o name | grep "$(params.qm-pod-grep)" | head -1)
-        [ -n "$POD" ] || { echo "No running queue-manager pod matching '$(params.qm-pod-grep)' in $NS"; exit 1; }
+        POD=$(oc get pods -n "$QM_NAMESPACE" --field-selector=status.phase=Running -o name | grep "$QM_POD_GREP" | head -1)
+        [ -n "$POD" ] || { echo "No running queue-manager pod matching '$QM_POD_GREP' in $QM_NAMESPACE"; exit 1; }
         POD=${POD#pod/}
-        echo "Gate-testing queue manager $(params.qm-name) via pod $POD in $NS"
+        echo "Gate-testing queue manager $QM_NAME via pod $POD in $QM_NAMESPACE (dedicated gate queue $GATE_QUEUE)"
         MARKER="promote-gate-check-marker"
-        oc exec -n "$NS" "$POD" -- bash -c "echo '$MARKER' | /opt/mqm/samp/bin/amqsput $(params.queue) $(params.qm-name)"
-        OUT=$(oc exec -n "$NS" "$POD" -- bash -c "/opt/mqm/samp/bin/amqsget $(params.queue) $(params.qm-name)" 2>&1 || true)
+        # define an isolated gate queue (idempotent) — values passed as positional args, not interpolated
+        oc exec -n "$QM_NAMESPACE" "$POD" -- bash -c 'printf "DEFINE QLOCAL(%s) REPLACE\n" "$1" | runmqsc "$2" >/dev/null' _ "$GATE_QUEUE" "$QM_NAME"
+        oc exec -n "$QM_NAMESPACE" "$POD" -- bash -c 'echo "$1" | /opt/mqm/samp/bin/amqsput "$2" "$3"' _ "$MARKER" "$GATE_QUEUE" "$QM_NAME"
+        OUT=$(oc exec -n "$QM_NAMESPACE" "$POD" -- bash -c '/opt/mqm/samp/bin/amqsget "$1" "$2"' _ "$GATE_QUEUE" "$QM_NAME" 2>&1 || true)
         if echo "$OUT" | grep -q "$MARKER"; then
-          echo "GATE PASS: a message round-tripped through $(params.qm-name) — the environment is functional, promotion may proceed."
+          echo "GATE PASS: a message round-tripped through $QM_NAME — the environment is functional, promotion may proceed."
         else
           echo "GATE FAIL: the test message was not read back."; echo "$OUT" | tail -8; exit 1
         fi

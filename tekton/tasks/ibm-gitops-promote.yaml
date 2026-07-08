@@ -9,10 +9,11 @@ metadata:
 spec:
   description: >-
     Promotion as a pull request. Copies a proven overlay from one environment directory to the
-    next in the gitops-apps repo, ensures the target environment's kustomization lists it, and
-    opens a PR — the machine proposes, a human merges, Argo CD deploys. Generic across products
-    (MQ, ACE) and environment hops via params. Needs the git-credentials secret (a PAT with repo
-    scope) in the pipeline namespace.
+    next in the gitops-apps repo, rebuilds the target environment's kustomization from the units
+    present, and opens a PR — the machine proposes, a human merges, Argo CD deploys. Generic
+    across products (MQ, ACE) and environment hops via params. Needs the git-credentials secret
+    (a PAT with repo scope). All params are passed as env vars (never interpolated into the
+    script) and the PR JSON is built with jq, so param values cannot inject shell/JSON.
   params:
     - name: gitops-org-repo
       description: "org/repo of the gitops-apps repository."
@@ -39,37 +40,66 @@ spec:
           valueFrom: { secretKeyRef: { name: git-credentials, key: username } }
         - name: GIT_PASS
           valueFrom: { secretKeyRef: { name: git-credentials, key: password } }
+        # params as env values (inert — not substituted into the script body)
+        - name: GITOPS_ORG_REPO
+          value: $(params.gitops-org-repo)
+        - name: PRODUCT_PATH
+          value: $(params.product-path)
+        - name: UNIT
+          value: $(params.unit)
+        - name: SRC_ENV
+          value: $(params.src-env)
+        - name: TARGET_ENV
+          value: $(params.target-env)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
       script: |
         #!/bin/sh
         set -e
         apk add --no-cache curl jq >/dev/null 2>&1 || true
         cd /tmp; rm -rf ga
-        git clone --depth 1 -b "$(params.base-branch)" "https://${GIT_USER}:${GIT_PASS}@github.com/$(params.gitops-org-repo).git" ga
+        git clone --depth 1 -b "$BASE_BRANCH" "https://${GIT_USER}:${GIT_PASS}@github.com/${GITOPS_ORG_REPO}.git" ga
         cd ga
-        SRC="$(params.product-path)/$(params.src-env)/$(params.unit)"
-        DST="$(params.product-path)/$(params.target-env)/$(params.unit)"
+        SRC="${PRODUCT_PATH}/${SRC_ENV}/${UNIT}"
+        DST="${PRODUCT_PATH}/${TARGET_ENV}/${UNIT}"
         [ -d "$SRC" ] || { echo "Source overlay $SRC not found"; exit 1; }
-        BRANCH="promote-$(params.unit)-$(params.src-env)-to-$(params.target-env)"
+        BRANCH="promote-${UNIT}-${SRC_ENV}-to-${TARGET_ENV}"
         git checkout -B "$BRANCH"
-        mkdir -p "$(params.product-path)/$(params.target-env)"
+        ENVDIR="${PRODUCT_PATH}/${TARGET_ENV}"
+        mkdir -p "$ENVDIR"
         rm -rf "$DST"; cp -r "$SRC" "$DST"
-        ENVKUST="$(params.product-path)/$(params.target-env)/kustomization.yaml"
-        if [ ! -f "$ENVKUST" ]; then
-          printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\n' "$(params.unit)" > "$ENVKUST"
-        elif ! grep -q "$(params.unit)" "$ENVKUST"; then
-          printf '  - %s\n' "$(params.unit)" >> "$ENVKUST"
-        fi
+        # rebuild the target-env kustomization from the units actually present (robust + idempotent)
+        {
+          echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+          echo "kind: Kustomization"
+          echo "resources:"
+          for d in "$ENVDIR"/*/; do [ -d "$d" ] && echo "  - $(basename "$d")"; done
+        } > "$ENVDIR/kustomization.yaml"
         git config user.email "tekton@ibmclientengineering"
         git config user.name "gitops promote pipeline"
         git add -A
         if git diff --cached --quiet; then
-          echo "No changes — $(params.target-env) already matches $(params.src-env). Nothing to promote."
+          echo "No changes — ${TARGET_ENV} already matches ${SRC_ENV}. Nothing to promote."
           exit 0
         fi
-        git commit -m "Promote $(params.unit): $(params.src-env) -> $(params.target-env)"
+        git commit -m "Promote ${UNIT}: ${SRC_ENV} -> ${TARGET_ENV}"
         git push -f origin "$BRANCH"
-        PR=$(curl -s -X POST -H "Authorization: token ${GIT_PASS}" -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/$(params.gitops-org-repo)/pulls" \
-          -d "{\"title\":\"Promote $(params.unit): $(params.src-env) -> $(params.target-env)\",\"head\":\"${BRANCH}\",\"base\":\"$(params.base-branch)\",\"body\":\"Automated promotion PR. The functional gate passed on $(params.src-env). Merge = go-live to $(params.target-env); Argo CD reconciles the target overlay.\"}")
-        URL=$(echo "$PR" | jq -r '.html_url // .message')
-        echo "PROMOTION PR: $URL"
+        # open a PR — build the JSON with jq (no hand-quoting), pass the token via stdin (not argv)
+        TITLE="Promote ${UNIT}: ${SRC_ENV} -> ${TARGET_ENV}"
+        BODY="Automated promotion PR. The functional gate passed on ${SRC_ENV}. Merge = go-live to ${TARGET_ENV}; Argo CD reconciles the target overlay."
+        PAYLOAD=$(jq -n --arg t "$TITLE" --arg h "$BRANCH" --arg b "$BASE_BRANCH" --arg body "$BODY" \
+          '{title:$t, head:$h, base:$b, body:$body}')
+        RESP=$(printf 'Authorization: token %s\n' "$GIT_PASS" \
+          | curl -s -X POST -H @- -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITOPS_ORG_REPO}/pulls" -d "$PAYLOAD")
+        URL=$(echo "$RESP" | jq -r '.html_url // empty')
+        if [ -n "$URL" ]; then
+          echo "PROMOTION PR: $URL"
+        else
+          MSG=$(echo "$RESP" | jq -r '.errors[0].message // .message // "unknown error"')
+          if echo "$MSG" | grep -qi "already exists"; then
+            echo "A promotion PR for $BRANCH already exists; its branch was updated."
+          else
+            echo "PR creation FAILED: $MSG"; echo "$RESP" | head -c 600; exit 1
+          fi
+        fi
