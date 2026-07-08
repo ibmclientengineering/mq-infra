@@ -1,0 +1,44 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: mq-qm-promote
+  labels:
+    app.kubernetes.io/part-of: mq-infra
+  annotations:
+    description: Gate-test a deployed queue manager, then promote its overlay to the next environment as a pull request.
+spec:
+  description: >-
+    The promotion half of the MQ factory. It gates on evidence — a functional put/get against the
+    queue manager in the source environment — and only then copies that proven overlay forward and
+    opens a pull request to the next environment. A machine assembles the evidence; a human reads the
+    diff and merges; Argo CD deploys. Reusable for any hop (dev→staging, staging→prod) via params.
+  params:
+    - name: unit
+      default: mq-qm01
+    - name: qm-name
+      default: QM1
+    - name: queue
+      default: IBM.DEMO.Q
+    - name: src-env
+      default: staging
+    - name: target-env
+      default: prod
+    - name: product-path
+      default: mq/environments
+  tasks:
+    - name: gate-test
+      taskRef:
+        name: ibm-mq-gate-test
+      params:
+        - { name: qm-namespace, value: "$(params.src-env)" }
+        - { name: qm-name, value: "$(params.qm-name)" }
+        - { name: queue, value: "$(params.queue)" }
+    - name: promote
+      runAfter: [ gate-test ]
+      taskRef:
+        name: ibm-gitops-promote
+      params:
+        - { name: product-path, value: "$(params.product-path)" }
+        - { name: unit, value: "$(params.unit)" }
+        - { name: src-env, value: "$(params.src-env)" }
+        - { name: target-env, value: "$(params.target-env)" }

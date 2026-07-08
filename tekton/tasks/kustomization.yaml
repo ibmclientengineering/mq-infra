@@ -3,9 +3,11 @@ kind: Kustomization
 resources:
   - ibm-setup.yaml
   - ibm-build-tag-push.yaml
-  - ibm-smoke-tests-mq.yaml
   - ibm-tag-release.yaml
   - ibm-img-release.yaml
   - ibm-img-scan.yaml
-  - ibm-gitops-kustomize-mq.yaml
+  - ibm-smoke-tests-mq.yaml
   - ibm-app-smoke-test.yaml
+  - ibm-gitops-kustomize-mq.yaml
+  - ibm-mq-gate-test.yaml
+  - ibm-gitops-promote.yaml

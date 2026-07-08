@@ -3,3 +3,4 @@ kind: Kustomization
 resources:
   - mq-qm-dev.yaml
   - mq-spring-app-dev.yaml
+  - mq-qm-promote.yaml

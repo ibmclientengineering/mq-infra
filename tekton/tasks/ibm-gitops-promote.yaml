@@ -1,0 +1,75 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ibm-gitops-promote
+  labels:
+    app.kubernetes.io/part-of: mq-infra
+  annotations:
+    description: Promote a proven overlay to the next environment by copying it and opening a pull request.
+spec:
+  description: >-
+    Promotion as a pull request. Copies a proven overlay from one environment directory to the
+    next in the gitops-apps repo, ensures the target environment's kustomization lists it, and
+    opens a PR — the machine proposes, a human merges, Argo CD deploys. Generic across products
+    (MQ, ACE) and environment hops via params. Needs the git-credentials secret (a PAT with repo
+    scope) in the pipeline namespace.
+  params:
+    - name: gitops-org-repo
+      description: "org/repo of the gitops-apps repository."
+      default: ibmclientengineering/multi-tenancy-gitops-apps
+    - name: product-path
+      description: The environments root for the product (e.g. mq/environments, ace/environments).
+      default: mq/environments
+    - name: unit
+      description: The unit subdirectory to promote (e.g. mq-qm01, createcustomer).
+      default: mq-qm01
+    - name: src-env
+      description: Source environment to promote FROM.
+      default: staging
+    - name: target-env
+      description: Target environment to promote TO.
+      default: prod
+    - name: base-branch
+      default: master
+  steps:
+    - name: promote
+      image: docker.io/alpine/git:2.45.2
+      env:
+        - name: GIT_USER
+          valueFrom: { secretKeyRef: { name: git-credentials, key: username } }
+        - name: GIT_PASS
+          valueFrom: { secretKeyRef: { name: git-credentials, key: password } }
+      script: |
+        #!/bin/sh
+        set -e
+        apk add --no-cache curl jq >/dev/null 2>&1 || true
+        cd /tmp; rm -rf ga
+        git clone --depth 1 -b "$(params.base-branch)" "https://${GIT_USER}:${GIT_PASS}@github.com/$(params.gitops-org-repo).git" ga
+        cd ga
+        SRC="$(params.product-path)/$(params.src-env)/$(params.unit)"
+        DST="$(params.product-path)/$(params.target-env)/$(params.unit)"
+        [ -d "$SRC" ] || { echo "Source overlay $SRC not found"; exit 1; }
+        BRANCH="promote-$(params.unit)-$(params.src-env)-to-$(params.target-env)"
+        git checkout -B "$BRANCH"
+        mkdir -p "$(params.product-path)/$(params.target-env)"
+        rm -rf "$DST"; cp -r "$SRC" "$DST"
+        ENVKUST="$(params.product-path)/$(params.target-env)/kustomization.yaml"
+        if [ ! -f "$ENVKUST" ]; then
+          printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\n' "$(params.unit)" > "$ENVKUST"
+        elif ! grep -q "$(params.unit)" "$ENVKUST"; then
+          printf '  - %s\n' "$(params.unit)" >> "$ENVKUST"
+        fi
+        git config user.email "tekton@ibmclientengineering"
+        git config user.name "gitops promote pipeline"
+        git add -A
+        if git diff --cached --quiet; then
+          echo "No changes — $(params.target-env) already matches $(params.src-env). Nothing to promote."
+          exit 0
+        fi
+        git commit -m "Promote $(params.unit): $(params.src-env) -> $(params.target-env)"
+        git push -f origin "$BRANCH"
+        PR=$(curl -s -X POST -H "Authorization: token ${GIT_PASS}" -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$(params.gitops-org-repo)/pulls" \
+          -d "{\"title\":\"Promote $(params.unit): $(params.src-env) -> $(params.target-env)\",\"head\":\"${BRANCH}\",\"base\":\"$(params.base-branch)\",\"body\":\"Automated promotion PR. The functional gate passed on $(params.src-env). Merge = go-live to $(params.target-env); Argo CD reconciles the target overlay.\"}")
+        URL=$(echo "$PR" | jq -r '.html_url // .message')
+        echo "PROMOTION PR: $URL"
