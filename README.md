@@ -1,136 +1,34 @@
 # mq-infra
 
-This project is the shared MQ build infrastructure — the Tekton pipeline and task library every queue manager repo builds with, plus the MQ image Dockerfile and Helm chart template.
+The IBM MQ **Tekton factory** — the reusable machinery for running IBM MQ as code: one parameterized task library and a set of pipelines that build, prove, and deliver queue managers and their apps through GitOps.
 
-## Table of Contents
+> Part of the **IBM Client Engineering Cloud Pak for Integration production-deployment demo** — this is the MQ build-and-promotion engine that feeds the shared GitOps repos every environment reconciles from.
 
-* [Introduction](#introduction)
-* [Pipeline (vendored + modernized)](#pipeline-vendored--modernized)
-* [Pre-requisites](#pre-requisites)
-* [Queuemanager Details](#queuemanager-details)
+## What this is
 
-## Introduction
+Change the params, not the tasks. One pipeline serves every queue manager: point it at a QM repo, and it builds the image, smoke-tests it against a real queue manager, scans it, and delivers a `QueueManager` custom resource as a kustomize overlay to the GitOps apps repo — ready for a pull request. A separate promotion pipeline gates on functional evidence, then copies the proven overlay to the next environment and opens the PR. The machine assembles the evidence; a human merges; Argo CD deploys.
 
-This guide provides a walkthrough on how to set up an Queuemanager.  The Github repository contains a Dockerfile and Helm Chart template, and — under `tekton/` — the vendored pipeline and task library (originally from the [Cloud Native Toolkit](https://cloudnativetoolkit.dev/)) used to build a Queuemanager image and deliver it through GitOps on a containerized instance of IBM MQ.
+## What's inside
 
-This repo contains the below artifacts.
+- **`tekton/pipelines/`** — three pipelines, all `tekton.dev/v1`:
+  - `mq-qm-dev` — build the queue-manager image, smoke-test it against a live QM, scan it, and deliver the `QueueManager` overlay to [multi-tenancy-gitops-apps](https://github.com/ibmclientengineering/multi-tenancy-gitops-apps).
+  - `mq-spring-app-dev` — build the JMS app image and prove it round-trips a message (send → recv) through a live queue manager.
+  - `mq-qm-promote` — a functional **put/get gate** on a dedicated queue, then promote the overlay to the next environment as a PR.
+- **`tekton/tasks/`** — the shared task library the pipelines compose: `ibm-setup`, `ibm-build-tag-push`, `ibm-smoke-tests-mq`, `ibm-img-scan`, `ibm-tag-release`, `ibm-img-release`, `ibm-gitops-kustomize-mq` (writes the overlay), `ibm-mq-gate-test` (the promotion gate), `ibm-gitops-promote` (copy-forward + PR), and `ibm-app-smoke-test`.
+- **`Dockerfile`** — the queue-manager image, `FROM` the entitled `ibm-mqadvanced-server-integration` base (pinned by digest), ready for MQSC to be baked in.
+- **`chart/base/`** — a Helm chart the smoke stage renders to stand up a throwaway `QueueManager` for testing, with `security` and `ha` (Native HA) flavors and MQSC config maps.
+- **`tekton/kustomization.yaml`** — apply the whole factory with one `oc apply -k tekton/`, or reference it as a remote kustomize base from GitOps.
 
+## Why it's built this way
 
-```
-.
-├── Dockerfile
-├── README.md
-├── chart
-    └── base
-        ├── Chart.yaml
-        ├── config
-        │   └── config.mqsc
-        ├── security
-        │   └── config.mqsc
-        ├── templates
-        │   ├── NOTES.txt
-        │   ├── _helpers.tpl
-        │   ├── configmap.yaml
-        │   └── qm-template.yaml
-        └── values.yaml
-└── tekton
-    ├── LICENSE                        # Apache-2.0 (upstream license for the vendored files)
-    ├── kustomization.yaml             # apply the whole factory with one kustomize build
-    ├── pipelines
-    │   └── mq-qm-dev.yaml             # the queue manager pipeline
-    └── tasks                          # the task library the pipeline references
-        ├── ibm-setup.yaml
-        ├── ibm-build-tag-push.yaml
-        ├── ibm-smoke-tests-mq.yaml
-        ├── ibm-tag-release.yaml
-        ├── ibm-img-release.yaml
-        ├── ibm-img-scan.yaml
-        └── ibm-gitops-kustomize-mq.yaml
-```
+- **Factory, not copy-paste.** The tasks are generic and parameterized, so a hundred queue managers share one audited pipeline. New QM? New params — no forked YAML to drift.
+- **Nothing ships unproven.** `mq-qm-dev` won't deliver an image the smoke test didn't stand up and connect to; `mq-qm-promote` won't advance an overlay the put/get gate didn't pass. The gate uses a **dedicated queue** — it never drains an application queue to prove liveness.
+- **Promotion is a pull request.** A machine proposes the change (copy the proven overlay forward, rebuild the target kustomization, open the PR); a human reviews the diff and merges; Argo CD reconciles. That's separation of duties and a full Git audit trail for every environment hop.
+- **The 2026 CR model.** Delivery writes a first-class `QueueManager` custom resource for the IBM MQ Operator as a kustomize overlay — not a deprecated Helm-release-into-Artifactory handoff. The overlay pins the exact tested image and MQSC, so what you reviewed is what deploys.
+- **Modernized and hardened.** Ported from the Cloud Native Toolkit's `ibm-garage-tekton-tasks` (Apache-2.0; license kept at `tekton/LICENSE`) and rebuilt against a live OpenShift 4.18 / Pipelines 1.22 cluster: `v1` APIs, current buildah/skopeo/tool images, the pod-security fixes that turn red validation runs green, and gate/promote scripts that pass params as inert env vars (never shell-interpolated).
 
-- `ibm-mqadvanced-server-integration` docker image that comes with CloudPaks. This image can be further customized if we need additional configurations that are part of queuemanager.
-- `Helm Charts` - Currently, we are using quickstart template as our base and building additional things on top of it for deploying the queuemanager.
-- `Configurations` - Like mentioned earlier, the configurations can be embedded as part of Dockerfile. Alternatively, they can also be injected as configmaps.
+## How it fits the bigger picture
 
+`mq-infra` is the MQ half of a pair of build factories. Its sibling, **ace-infra**, does the same for App Connect Enterprise — `ibm-gitops-promote` is deliberately product-generic (point `product-path` at `ace/environments` and it promotes ACE too). Both factories deliver into **[multi-tenancy-gitops-apps](https://github.com/ibmclientengineering/multi-tenancy-gitops-apps)**, the workload layer of the four-repo **multi-tenancy-gitops** family (root `multi-tenancy-gitops` → `-infra` → `-services` → `-apps`) that Argo CD reconciles onto the cluster. `mq-spring-app-dev` builds the JMS application from **mq-spring-app** and proves it against a running queue manager, closing the loop from broker to app.
 
-## Pipeline (vendored + modernized)
-
-**Provenance:** the pipeline and tasks under `tekton/` are ported from the Cloud Native Toolkit's [IBM/ibm-garage-tekton-tasks](https://github.com/IBM/ibm-garage-tekton-tasks) (pipeline `ibm-mq` and the `ibm-*` tasks it references), licensed Apache-2.0 — the upstream license text is kept at `tekton/LICENSE`. They were vendored here in July 2026 so this repo actually owns the factory role, and modernized against a live OpenShift 4.18 / OpenShift Pipelines 1.22 cluster:
-
-- **Tekton `tekton.dev/v1`** for the Pipeline and all Tasks (upstream is `v1beta1`; it still converts today, but v1 is the API current clusters serve).
-- **Pod-security fixes** — the real 2021 rot. The buildah/skopeo steps of `ibm-build-tag-push` and `ibm-img-release` carry `securityContext: {capabilities: {add: [SETFCAP]}}` (without it buildah dies writing `uid_map` under current SCCs), and the `ibm-smoke-tests-mq` deploy/health-check/cleanup steps run with `runAsUser: 0` so they can write the shared clone volume. Both fixes are exactly the patches that turned red validation PipelineRuns green.
-- **Kustomize delivery** — the upstream `ibm-helm-release` (Artifactory) + `ibm-gitops` (Helm-chart reference) stages are replaced by one `ibm-gitops-kustomize-mq` task that writes the tested image + MQSC as a kustomize overlay (`queuemanager.yaml`, `kustomization.yaml`, `static-definitions.mqsc`) to a delivery branch of [multi-tenancy-gitops-apps](https://github.com/ibmclientengineering/multi-tenancy-gitops-apps), ready for a PR.
-- **Maintained step images** — the EOL `node:lts-stretch`, `ibmcloud-dev` (yq v3) and 2021 buildah/skopeo pins are replaced with current images (buildah/skopeo at the digests OpenShift Pipelines itself ships; `alpine/k8s` as the kubectl+helm+yq tools image, scripts ported to yq v4; `node:22` for release tagging; pinned Trivy).
-
-The pipeline is named **`mq-qm-dev`** and exposes: `git-url`, `git-revision`, `scan-image`, `image-url` (registry override; empty = the internal registry `image-registry.openshift-image-registry.svc:5000/<namespace>/<repo>:<short-sha>`), `security` and `ha` (which chart/kustomize flavor the smoke and delivery stages use), and `gitops-repo-url` (where the delivery stage pushes). Before the first run the pipeline namespace needs the `ibm-entitled-registry-credentials` (or `registry-auth`) secret so buildah can pull the entitled MQ base image, and a `git-credentials` secret (username/password) so the tag-release and gitops stages can push. The cluster's integrated image registry must be enabled (`managementState: Managed`) — it is the only in-cluster registry nodes can pull from.
-
-The intended consumption path is GitOps: `mq/environments/ci/pipelines` in your `multi-tenancy-gitops-apps` fork references `tekton/` here as a remote kustomize base, so an Argo CD Application delivers the Pipelines and Tasks into the `ci` namespace by commit. `oc apply -k tekton/` works for a manual bootstrap.
-
-## Pre-requisites
-
-- [IBM Catalog Operator](https://www.ibm.com/docs/en/app-connect/11.0.0?topic=iicia-enabling-operator-catalog-cloud-pak-foundational-services-operator)
-- [IBM Common Services](https://github.com/IBM/ibm-common-service-operator)
-- [IBM MQ Operator](https://www.ibm.com/docs/en/ibm-mq/9.2?topic=integration-using-mq-in-cloud-pak-openshift)
-
-## Queuemanager Details
-
-- Intially, security and native HA are disabled.
-- To enable security, set `security` to true in `Values.yaml`.
-- To enable high availability, set `ha` to true in `Values.yaml`.
-
-Note: This project demonstrates how to add in the `mqsc` configuration files. Similarly, if you want to configure an `qm.ini`, please create a configMap for the same and inject it under `spec.queueManager` in the `qm-template.yaml` using the below snippet.
-
-```yaml
-ini:
-- configMap:
-    name: {{ .Values.ini.configmap }}
-    items:
-    - {{ .Values.ini.name }}
-```
-
-### Configuration
-
-- Create required queues to store info.
-- Create channel to provide necessary communication links.
-- For this queuemanager, channel authentication is disabled.
-
-## Enable Security
-
-If you want to enable the queuemanager to use security, we need to set the `security` flag to `true` in `Values.yaml`. By default, it is always `false`.
-
-### Configuration
-
-- Create required queues to store info.
-- Except for the channel used by MQ Explorer, all channels with inbound connections are blocked.
-- Create channel to provide necessary communication links.
-- Allow access to the LDAP channel.
-- Privileged user IDs asserted by a client-connection channel are blocked by means of the special value *MQADMIN* by default. We are removing this default rule.
-- For authentication, our queuemanage is using LDAP. We define necessary LDAP configurations. Our sample configurations as follows.
-
-  ```
-    DEFINE AUTHINFO(USE.LDAP) +
-    AUTHTYPE(IDPWLDAP) +
-    CONNAME('openldap.openldap(389)') +
-    LDAPUSER('cn=admin,dc=ibm,dc=com') LDAPPWD('admin') +
-    SECCOMM(NO) +
-    USRFIELD('uid') +
-    SHORTUSR('uid') +
-    BASEDNU('ou=people,dc=ibm,dc=com') +
-    AUTHORMD(SEARCHGRP) +
-    BASEDNG('ou=groups,dc=ibm,dc=com') +
-    GRPFIELD('cn') +
-    CLASSGRP('groupOfUniqueNames') +
-    FINDGRP('uniqueMember') +
-    CHCKCLNT(REQUIRED) +
-    REPLACE
-    ALTER QMGR CONNAUTH(USE.LDAP)
-  ```
-- Enable TLS protocol security. We can specify the cryptographic algorithms that are used by the TLS protocol by supplying a CipherSpec as part of the channel definition along with the authenticated user information.
-- This privileged user will be allowed to access the queue manager and interact with it.
-
-## Enable Native HA
-
-If you want to enable the queuemanager to use native high avaibility capability, we need to set the `ha` flag to `true` in `Values.yaml`. By default, it is always `false`.
-
-- A Native HA configuration provides a highly available queue manager where the recoverable MQ data (for example, the messages)  are replicated across multiple sets of storage, preventing loss from storage failures.
-- This is suitable for use with cloud block storage.
+Maintained by IBM Client Engineering.
